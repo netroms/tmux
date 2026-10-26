@@ -1,0 +1,5 @@
+# Author: Morten (Morty) <netroms@gmail.com>
+# Build output of scripts/build_all.sh and local smoke runs.
+/build/
+/dist/
+/tmux-src/

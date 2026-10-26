@@ -1,0 +1,163 @@
+# Author: Morten (Morty) <netroms@gmail.com>
+#
+# Static musl builds of upstream tmux (the tag pinned in versions.env) for
+# linux-x86_64 and linux-arm64. Adapted from tmux/tmux-builds (see LICENSE).
+# Pushes to mc/release and manual runs build and smoke; a tag `<tmux>-mc.<n>`
+# (for example 3.8-mc.1) also publishes the GitHub Release.
+name: release
+
+on:
+  push:
+    branches: [mc/release]
+    tags: ['*-mc.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PREFIX: /tmp/build
+
+jobs:
+  build:
+    name: build (linux-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs_on: ubuntu-24.04
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Name the release
+        run: |
+          source versions.env
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            case "${GITHUB_REF_NAME}" in
+              "${TMUX_VERSION}"-mc.[0-9]*) ;;
+              *) echo "tag ${GITHUB_REF_NAME} does not match versions.env TMUX_VERSION=${TMUX_VERSION} (expected ${TMUX_VERSION}-mc.<n>)" >&2; exit 1 ;;
+            esac
+            echo "RELEASE=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE=${TMUX_VERSION}-mc.dev" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y automake autoconf bison build-essential curl file git pkg-config tar
+
+      - name: Build musl
+        run: ./scripts/build_musl.sh
+
+      - name: Build libevent
+        run: CC="${PREFIX}/bin/musl-gcc -static" ./scripts/build_libevent.sh
+
+      - name: Build ncurses
+        run: CC="${PREFIX}/bin/musl-gcc -static" ./scripts/build_ncurses.sh
+
+      - name: Build tmux (pinned upstream tag)
+        run: CC="${PREFIX}/bin/musl-gcc -static" ./scripts/build_tmux.sh
+
+      - name: Verify the binary is static and the pinned version
+        run: ./scripts/verify_tmux.sh
+
+      - name: Smoke - OSC 9;4 fills pane_pb_state
+        run: ./scripts/smoke_pb_state.sh "${PREFIX}/bin/tmux"
+
+      - name: Package
+        run: ./scripts/package.sh "${RELEASE}" "${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tmux-linux-${{ matrix.arch }}
+          path: dist/tmux-*-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  # The fleet runs the distro tmux (Ubuntu 26.04: 3.6a). A 3.8 client has to
+  # drive such a server: the same commands Mission Control sends.
+  compat:
+    name: compat (3.8 client, distro 3.6 server, ${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs_on: ubuntu-26.04
+          - arch: arm64
+            runs_on: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tmux-linux-${{ matrix.arch }}
+          path: dl
+
+      - name: Distro tmux is the 3.6 the fleet runs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          /usr/bin/tmux -V
+          case "$(/usr/bin/tmux -V)" in
+            "tmux 3.6"*) ;;
+            *) echo "distro tmux is not 3.6.x, the compat smoke needs the fleet's server version" >&2; exit 1 ;;
+          esac
+
+      - name: 3.8 client against the 3.6 server
+        run: |
+          mkdir new
+          tar -xzf dl/tmux-*-linux-${{ matrix.arch }}.tar.gz -C new
+          ./scripts/smoke_compat.sh "$PWD/new/tmux" /usr/bin/tmux
+
+  licenses:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/collect_licenses.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LICENSES.tar.gz
+          path: ${{ env.PREFIX }}/LICENSES.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, compat, licenses]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum tmux-*-linux-x86_64.tar.gz tmux-*-linux-arm64.tar.gz LICENSES.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: Publish
+        run: |
+          source versions.env
+          notes="Static musl builds of upstream tmux ${TMUX_VERSION} (commit ${TMUX_COMMIT}), no source changes. Each tarball holds one \`tmux\` binary at its root. Terminfo search path /etc/terminfo:/lib/terminfo:/usr/share/terminfo. Dependencies: musl ${MUSL_VERSION}, libevent ${LIBEVENT_VERSION}, ncurses ${NCURSES_VERSION}. Verify with SHA256SUMS."
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --title "tmux ${GITHUB_REF_NAME}" --notes "$notes" --verify-tag
+          fi
