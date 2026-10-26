@@ -28,6 +28,6 @@ sh autogen.sh
     CPPFLAGS="-I${PREFIX}/include"
 
 make -j"$(ncpu)"
-make install
+make install-strip
 
 rm -rf "${PREFIX}/src"
